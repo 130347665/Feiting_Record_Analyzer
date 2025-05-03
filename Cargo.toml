@@ -1,0 +1,25 @@
+[package]
+name = "car_sport_history"
+version = "0.1.0"
+edition = "2024"
+
+# 添加這個部分來指定 Windows 子系統
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+# 額外添加此配置
+[[bin]]
+name = "car_sport_history"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+eframe = "0.31.1"
+chrono = "0.4.41"
+
+[build-dependencies]
+winres = "0.1"
