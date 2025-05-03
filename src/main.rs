@@ -1,5 +1,5 @@
 #![windows_subsystem = "windows"]  // 添加這一行到 main.rs 文件頂部
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::{egui, App, Frame};
 use reqwest::Client;
@@ -16,13 +16,13 @@ struct DrawResult {
     detail: String,
 }
 // 定義遊戲類型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameType {
-    SGFeiTing,      // SG飛艇
+    SGFeiTing,       // SG飛艇
     XingYunFeiTing, // 幸運飛艇
     JiSuFeiTing,    // 急速飛艇
     JiSuSaiChe,     // 急速賽車
 }
-
 impl GameType {
     fn to_url(&self) -> &str {
         match self {
@@ -41,7 +41,33 @@ impl GameType {
             GameType::JiSuSaiChe => "急速賽車",
         }
     }
+    fn all() -> impl Iterator<Item = Self> {
+        [
+            GameType::SGFeiTing,
+            GameType::XingYunFeiTing,
+            GameType::JiSuFeiTing,
+            GameType::JiSuSaiChe,
+        ]
+        .iter()
+        .copied()
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RulePart {
+    positions: Vec<usize>, // Positions to check (1-based index)
+    pattern: Vec<char>,    // Pattern characters (e.g., ['单', '单', '单', '单'])
+}
+
+#[derive(Debug, PartialEq)]
+pub enum FindPatternError {
+    InvalidInputFormat(String),
+    InvalidPosition(String),
+    EmptyPattern,
+    DrawDataError(String), // Errors related to accessing/parsing draw data (optional)
+}
+
+
 pub struct MyApp {
     draws: Vec<DrawResult>,
     filter: String,
@@ -49,444 +75,304 @@ pub struct MyApp {
     rt: Runtime,
     cookie: String, // 新增：用於存儲用戶輸入的 Cookie
     current_game: GameType, // 當前選擇的遊戲類型
-    game_checkboxes: HashMap<String, bool>, // 存儲遊戲選擇狀態的HashMap
 }
 
+fn determine_characteristic(num: u32) -> String {
+    let size = if num >= 6 { '大' } else { '小' };
+    // Use consistent Traditional Chinese characters for display
+    let parity = if num % 2 == 0 { '雙' } else { '單' };
+    format!("{}{}", size, parity)
+}
 
 impl MyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         use egui::{FontData, FontDefinitions, FontFamily};
-    
-        // ✅ 修改字型配置
         let mut fonts = FontDefinitions::default();
         fonts.font_data.insert(
             "my_font".to_owned(),
-            std::sync::Arc::new(FontData::from_static(include_bytes!("C:/Windows/Fonts/msyh.ttc"))), // 微軟正黑體
+             // Consider embedding or using a relative path
+            std::sync::Arc::new(FontData::from_static(include_bytes!(
+                "C:/Windows/Fonts/msyh.ttc" // WARNING: Hardcoded path
+            ))),
         );
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "my_font".to_owned());
-        fonts
-            .families
-            .entry(FontFamily::Monospace)
-            .or_default()
-            .push("my_font".to_owned());
-    
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "my_font".to_owned());
+        fonts.families.entry(FontFamily::Monospace).or_default().push("my_font".to_owned());
         cc.egui_ctx.set_fonts(fonts);
-        // 初始化遊戲選擇狀態
-        let mut game_checkboxes = HashMap::new();
-        game_checkboxes.insert("SG飛艇".to_string(), true); // 默認選擇SG飛艇
-        game_checkboxes.insert("幸運飛艇".to_string(), false);
-        game_checkboxes.insert("急速飛艇".to_string(), false);
-        game_checkboxes.insert("急速賽車".to_string(), false);
-    
+
         Self {
             draws: vec![],
             filter: "".into(),
-            status: "請點擊『獲取數據』".into(),
+            status: "請選擇遊戲並輸入Cookie後點擊『獲取數據』".into(),
             rt: tokio::runtime::Runtime::new().unwrap(),
-            cookie: String::new(), // 新增：用於存儲用戶輸入的 Cookie
-            current_game: GameType::SGFeiTing, // 默認遊戲類型
-            game_checkboxes,
+            cookie: String::new(),
+            current_game: GameType::SGFeiTing,
         }
     }
-    
+
     fn fetch_data(&mut self) {
-        // 檢查Cookie是否已輸入
         if self.cookie.trim().is_empty() {
             self.status = "❌ 請先輸入Cookie後再獲取數據".into();
             return;
         }
-
-        // 獲取當前選中的遊戲類型
         let game_url = self.current_game.to_url();
         let game_name = self.current_game.to_name();
-        self.status = "📡 資料抓取中...".into();
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("accept", "application/json, text/plain, */*".parse().unwrap());
-        headers.insert("accept-language", "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,lb;q=0.6,zh-CN;q=0.5".parse().unwrap());
-        headers.insert("priority", "u=1, i".parse().unwrap());
-        headers.insert("referer", "https://www.15678.vip/player/lottery/LUCKYSB".parse().unwrap());
-        headers.insert("sec-ch-ua", "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"".parse().unwrap());
-        headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
-        headers.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
-        headers.insert("sec-fetch-dest", "empty".parse().unwrap());
-        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
-        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
-        headers.insert("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".parse().unwrap());
-        headers.insert(reqwest::header::COOKIE, self.cookie.parse().unwrap());
+        self.status = format!("📡 ({}) 資料抓取中...", game_name).into();
+        let cookie = self.cookie.clone();
+        let current_game_url = self.current_game.to_url().to_string();
 
-        let client = Client::new();
         let result = self.rt.block_on(async {
-            client
-                .get(format!("https://www.15678.vip/member/dayResult?lottery={}", game_url))
-                .headers(headers)
-                .send()
-                .await?
-                .json::<Vec<DrawResult>>()
-                .await
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("accept", "application/json, text/plain, */*".parse().unwrap());
+            headers.insert("accept-language", "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7".parse().unwrap());
+            headers.insert("sec-ch-ua", "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not.A/Brand\";v=\"99\"".parse().unwrap());
+            headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+            headers.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
+            headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+            headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+            headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+            headers.insert("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".parse().unwrap());
+            headers.insert("referer", format!("https://www.15678.vip/player/lottery/{}", current_game_url).parse().unwrap());
+             if let Ok(cookie_header) = cookie.parse() { headers.insert(reqwest::header::COOKIE, cookie_header); }
+             else { eprintln!("Warning: Failed to parse cookie header"); }
+
+            let client = Client::builder().build().map_err(|e| e.to_string())?;
+            client.get(format!("https://www.15678.vip/member/dayResult?lottery={}", current_game_url))
+                .headers(headers).send().await.map_err(|e| e.to_string())?
+                .json::<Vec<DrawResult>>().await.map_err(|e| e.to_string())
         });
 
         match result {
             Ok(data) => {
                 self.draws = data;
-                self.status = format!("✅ 共載入 {} 筆資料", self.draws.len());
+                 self.draws.sort_by(|a, b| a.drawNumber.cmp(&b.drawNumber));
+                self.status = format!("✅ ({}) 共載入 {} 筆資料", game_name, self.draws.len());
             }
             Err(err) => {
-                self.status = format!("❌ 載入失敗: {}", err);
+                self.status = format!("❌ ({}) 載入失敗: {}", game_name, err);
+                self.draws.clear();
             }
         }
     }
-    fn find_all_consecutive_patterns(&self, pattern_input: &str) -> Vec<Vec<&DrawResult>> {
-        let trimmed_input = pattern_input.trim();
+
+    fn parse_rule_string(&self, pattern_input: &str) -> Result<Vec<RulePart>, FindPatternError> {
+        let mut rules = Vec::new();
+        let mut chars = pattern_input.chars().peekable();
+        while chars.peek().is_some() {
+            while let Some(&c) = chars.peek() { if c.is_whitespace() { chars.next(); } else { break; } }
+            if chars.peek().is_none() { break };
+            let mut positions_str = String::new();
+            while let Some(&c) = chars.peek() { if c.is_ascii_digit() { positions_str.push(chars.next().unwrap()); } else { break; } }
+            if positions_str.is_empty() { return Err(FindPatternError::InvalidInputFormat(format!("規則必須以位置數字開頭，但找到 '{:?}'", chars.peek()))); }
+            let positions: Vec<usize> = positions_str.chars().map(|c| c.to_digit(10).unwrap() as usize).collect();
+             if positions.iter().any(|&p| p == 0) || positions.len() != positions_str.len() { return Err(FindPatternError::InvalidPosition(format!("無效的位置數字 '{}'", positions_str))); }
+            let mut pattern_chars = Vec::new();
+            while let Some(&c) = chars.peek() {
+                 if !c.is_ascii_digit() && !c.is_whitespace() {
+                    match c { '单' | '單' | '双' | '雙' | '大' | '小' => pattern_chars.push(chars.next().unwrap()),
+                         _ => return Err(FindPatternError::InvalidInputFormat(format!("無效的模式字符 '{}'", c))), }
+                 } else { break; }
+            }
+            if pattern_chars.is_empty() { return Err(FindPatternError::EmptyPattern); }
+            rules.push(RulePart { positions, pattern: pattern_chars });
+        }
+         if rules.is_empty() && !pattern_input.trim().is_empty() { return Err(FindPatternError::InvalidInputFormat("輸入解析後未找到任何有效規則".to_string())); }
+        Ok(rules)
+    }
+
+    fn check_num_match(&self, num: u32, pattern_char: char) -> bool {
+        match pattern_char {
+            '单' | '單' => num % 2 != 0, '双' | '雙' => num % 2 == 0,
+            '大' => num >= 6, '小' => num < 6, _ => false,
+        }
+    }
+
+    // --- Modified find_matching_sequences to return parsed rules ---
+    fn find_matching_sequences(&self) -> Result<(Vec<Vec<&DrawResult>>, Vec<RulePart>), FindPatternError>
+    {
+        let trimmed_input = self.filter.trim(); // Use self.filter directly
         if self.draws.is_empty() || trimmed_input.is_empty() {
-            return vec![];
+            // Return empty rules if no input, successful parse but no rules essentially
+             return Ok((vec![], vec![]));
         }
 
-        // 分割不同位置的模式，這次 **保留** 空字串，但去除每個部分的前後空白
-        let position_patterns: Vec<&str> = trimmed_input
-            .split(',')
-            .map(|s| s.trim()) // 去除每個部分的前後空白
+        // 1. Parse the input string first
+        let rules = self.parse_rule_string(trimmed_input)?; // Propagate parse error
+        if rules.is_empty() {
+             return Ok((vec![], rules)); // Parsed ok, but no rules found
+        }
+
+        // 2. Prepare data (already sorted)
+        let draws_sorted = &self.draws;
+
+        // 3. Find matches
+        let mut matched_sequence_indices: HashSet<(usize, usize)> = HashSet::new();
+        for rule_part in &rules { // Use the parsed rules
+            let pattern_len = rule_part.pattern.len();
+            if pattern_len == 0 || draws_sorted.len() < pattern_len { continue; }
+
+            'window_loop: for start_idx in 0..=draws_sorted.len() - pattern_len {
+                let window = &draws_sorted[start_idx..start_idx + pattern_len];
+                let mut window_matches_this_rule = false;
+                for &pos in &rule_part.positions {
+                    if pos == 0 { continue; }
+                    let mut current_pos_matches_all_draws = true;
+                    for i in 0..pattern_len {
+                        let draw = &window[i];
+                        let target_char = rule_part.pattern[i];
+                        let numbers_res: Result<Vec<u32>, _> = draw.result.split(',').map(|s| s.trim().parse::<u32>()).collect();
+                        match numbers_res {
+                             Ok(numbers) => {
+                                if pos > numbers.len() { current_pos_matches_all_draws = false; break; }
+                                let num_at_pos = numbers[pos - 1];
+                                if !self.check_num_match(num_at_pos, target_char) { current_pos_matches_all_draws = false; break; }
+                            }
+                            Err(_) => { current_pos_matches_all_draws = false; break; } // Handle parse error for draw result
+                        }
+                    }
+                    if current_pos_matches_all_draws { window_matches_this_rule = true; break; }
+                }
+                if window_matches_this_rule { matched_sequence_indices.insert((start_idx, pattern_len)); }
+            }
+        }
+
+        // 4. Convert indices to results
+        let mut sorted_indices: Vec<(usize, usize)> = matched_sequence_indices.into_iter().collect();
+        sorted_indices.sort_by_key(|&(start, _)| start);
+        let all_matches = sorted_indices.into_iter()
+            .map(|(start, len)| draws_sorted[start..start + len].iter().collect())
             .collect();
 
-        // 如果分割後所有部分都是空的（例如輸入只有逗號），則返回空
-        if position_patterns.iter().all(|s| s.is_empty()) {
-             return vec![];
-        }
-
-        // 按期號升序排序
-        let mut draws_sorted: Vec<&DrawResult> = self.draws.iter().collect();
-        draws_sorted.sort_by(|a, b| a.drawNumber.cmp(&b.drawNumber));
-
-        // --- 確定基準模式長度 (pattern_len) ---
-        // 找到第一個非空模式來確定長度
-        let mut pattern_len = 0;
-        let mut first_valid_pattern_parts: Option<Vec<&str>> = None;
-
-        for pattern_str in &position_patterns {
-            if !pattern_str.is_empty() {
-                let parts: Vec<&str> = pattern_str
-                    .as_bytes()
-                    .chunks(3) // 假設中文佔3字節
-                    .filter_map(|c| std::str::from_utf8(c).ok())
-                    .filter(|s| !s.trim().is_empty()) // 確保解析出的部分不是空的
-                    .collect();
-
-                if !parts.is_empty() {
-                    pattern_len = parts.len();
-                    first_valid_pattern_parts = Some(parts);
-                    break; // 找到第一個有效的就停止
-                }
-            }
-        }
-
-        // 如果找不到任何有效的非空模式，或者第一個有效模式解析不出長度，則無法匹配
-        if pattern_len == 0 || first_valid_pattern_parts.is_none() {
-            return vec![];
-        }
-        // --- 基準模式長度確定完畢 ---
-
-
-        // 儲存所有匹配的結果
-        let mut all_matches: Vec<Vec<&DrawResult>> = vec![];
-
-        // 檢查每個可能的起始位置
-        for start_idx in 0..=draws_sorted.len().saturating_sub(pattern_len) {
-            let mut matches_all_required_positions = true; // 標記是否匹配了所有 **需要** 檢查的位置
-
-            // 遍歷定義的模式（包括空字串代表的跳過位置）
-            'position_loop: for (position_idx, position_pattern) in position_patterns.iter().enumerate() {
-
-                // ******** 核心修改：檢查是否需要跳過此位置 ********
-                if position_pattern.is_empty() {
-                    // 如果當前模式是空的，代表用戶想跳過這個位置的檢查
-                    continue 'position_loop; // 直接跳到下一個 position_pattern
-                }
-                // ******** 跳過檢查邏輯結束 ********
-
-
-                // --- 如果不需要跳過，則執行檢查 ---
-                let position_to_check = position_idx + 1; // 位置從1開始計數
-
-                // 解析當前位置的模式 (只有非空時才解析)
-                let pattern_parts: Vec<&str> = position_pattern
-                    .as_bytes()
-                    .chunks(3)
-                    .filter_map(|c| std::str::from_utf8(c).ok())
-                    .filter(|s| !s.trim().is_empty())
-                    .collect();
-
-                // **健壯性檢查**: 確保解析出的模式長度與基準長度一致
-                if pattern_parts.len() != pattern_len {
-                    // 如果這個非空模式的長度與基準長度不同，則認為格式錯誤，匹配失敗
-                    matches_all_required_positions = false;
-                    break 'position_loop;
-                }
-
-
-                // 檢查這個起始位置開始的 pattern_len 個期數是否匹配當前位置的模式
-                for i in 0..pattern_len {
-                    // 索引 i 對於 pattern_parts 是安全的，因為上面檢查了長度一致性
-                    let draw = draws_sorted[start_idx + i];
-
-                    let numbers: Vec<u32> = draw.result
-                        .split(',')
-                        .filter_map(|s| s.trim().parse::<u32>().ok())
-                        .collect();
-
-                    // 確保開獎結果有足夠的數字來檢查這個位置
-                    if position_to_check > numbers.len() {
-                        matches_all_required_positions = false;
-                        break 'position_loop;
-                    }
-
-                    let num_at_position = numbers[position_to_check - 1]; // 索引從0開始
-
-                    let is_match = match pattern_parts[i] {
-                        "單" | "单" => num_at_position % 2 != 0,
-                        "雙" | "双" => num_at_position % 2 == 0,
-                        "大" => num_at_position >= 6,
-                        "小" => num_at_position < 6,
-                        _ => false,
-                    };
-
-                    if !is_match {
-                        // 只要有一個不匹配，當前 start_idx 的嘗試就失敗了
-                        matches_all_required_positions = false;
-                        break 'position_loop; // 跳出對所有位置的檢查，處理下一個 start_idx
-                    }
-                } // end inner loop for i
-            } // end 'position_loop (遍歷所有定義的模式)
-
-            // 如果成功匹配了所有 **需要檢查** 的位置
-            if matches_all_required_positions {
-                all_matches.push(draws_sorted[start_idx..start_idx + pattern_len].to_vec());
-            }
-        } // end outer loop for start_idx
-
-        all_matches
+        // Return matches AND the parsed rules
+        Ok((all_matches, rules))
     }
-    // 新增：時間戳轉北京時間函數（支持毫秒級時間戳）
+
+
     fn timestamp_to_beijing_time(timestamp: u64) -> String {
-        // 檢查是否為毫秒級時間戳（13位數字）
-        let timestamp_seconds = if timestamp > 10000000000 {
-            // 毫秒轉秒
-            timestamp / 1000
-        } else {
-            // 已經是秒級
-            timestamp
-        };
-        
-        // 獲取毫秒部分用於顯示
-        let milliseconds = if timestamp > 10000000000 {
-            timestamp % 1000
-        } else {
-            0
-        };
-        
-        // 創建一個UTC時間
-        let utc_time = match Utc.timestamp_opt(timestamp_seconds as i64, 0) {
-            chrono::offset::LocalResult::Single(dt) => dt,
-            _ => return "時間格式錯誤".to_string(),
-        };
-        
-        // 創建北京時區 (UTC+8)
-        let beijing_timezone = FixedOffset::east_opt(8 * 3600).unwrap();
-        
-        // 轉換為北京時間
-        let beijing_time: DateTime<FixedOffset> = utc_time.with_timezone(&beijing_timezone);
-        
-        // 格式化時間（包含毫秒）
-        if milliseconds > 0 {
-            beijing_time.format("%Y-%m-%d %H:%M:%S").to_string() + &format!(".{:03}", milliseconds)
-        } else {
-            beijing_time.format("%Y-%m-%d %H:%M:%S").to_string()
-        }
+         let timestamp_seconds = if timestamp > 10_000_000_000 { timestamp / 1000 } else { timestamp };
+         let milliseconds = if timestamp > 10_000_000_000 { timestamp % 1000 } else { 0 };
+         match Utc.timestamp_opt(timestamp_seconds as i64, 0) {
+             chrono::LocalResult::Single(utc_time) => {
+                 let beijing_timezone = FixedOffset::east_opt(8 * 3600).unwrap(); // UTC+8
+                 let beijing_time: DateTime<FixedOffset> = utc_time.with_timezone(&beijing_timezone);
+                 if milliseconds > 0 { format!("{}.{:03}", beijing_time.format("%Y-%m-%d %H:%M:%S"), milliseconds) }
+                 else { beijing_time.format("%Y-%m-%d %H:%M:%S").to_string() }
+             },
+             _ => "時間格式錯誤".to_string(),
+         }
     }
 }
+
 
 impl App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🏁 飛艇歷史數據查詢器");
-            // 新增：Cookie輸入框
-            ui.horizontal(|ui| {
-                ui.label("🔑 Cookie:");
-                ui.text_edit_singleline(&mut self.cookie);
-            });
-    
-            // 遊戲類型選擇區域
+            ui.horizontal(|ui| { ui.label("🔑 Cookie:"); ui.text_edit_singleline(&mut self.cookie); });
+            ui.separator();
             ui.heading("選擇遊戲類型");
-            
-            // 使用單選按鈕來選擇不同遊戲類型
-            ui.horizontal(|ui| {
-                if ui.radio(*self.game_checkboxes.get("SG飛艇").unwrap_or(&false), "SG飛艇").clicked() {
-                    // 更新所有遊戲選擇狀態
-                    for (game, checked) in self.game_checkboxes.iter_mut() {
-                        *checked = game == "SG飛艇";
-                    }
-                    self.current_game = GameType::SGFeiTing;
-                    self.draws.clear(); // 清除之前的數據
-                }
-                
-                if ui.radio(*self.game_checkboxes.get("幸運飛艇").unwrap_or(&false), "幸運飛艇").clicked() {
-                    // 更新所有遊戲選擇狀態
-                    for (game, checked) in self.game_checkboxes.iter_mut() {
-                        *checked = game == "幸運飛艇";
-                    }
-                    self.current_game = GameType::XingYunFeiTing;
-                    self.draws.clear(); // 清除之前的數據
-                }
-                
-                if ui.radio(*self.game_checkboxes.get("急速飛艇").unwrap_or(&false), "急速飛艇").clicked() {
-                    // 更新所有遊戲選擇狀態
-                    for (game, checked) in self.game_checkboxes.iter_mut() {
-                        *checked = game == "急速飛艇";
-                    }
-                    self.current_game = GameType::JiSuFeiTing;
-                    self.draws.clear(); // 清除之前的數據
-                }
-                
-                if ui.radio(*self.game_checkboxes.get("急速賽車").unwrap_or(&false), "急速賽車").clicked() {
-                    // 更新所有遊戲選擇狀態
-                    for (game, checked) in self.game_checkboxes.iter_mut() {
-                        *checked = game == "急速賽車";
-                    }
-                    self.current_game = GameType::JiSuSaiChe;
-                    self.draws.clear(); // 清除之前的數據
-                }
+            ui.horizontal_wrapped(|ui| {
+                let mut changed_game = false; let current_game = self.current_game;
+                for game_type in GameType::all() {
+                    if ui.radio_value(&mut self.current_game, game_type, game_type.to_name()).clicked() && self.current_game != current_game { changed_game = true; } }
+                 if changed_game { self.draws.clear(); self.status = format!("已選擇 {}, 請點擊獲取數據", self.current_game.to_name()).into(); }
             });
-    
-            if ui.button("📥 獲取數據").clicked() {
-                self.fetch_data();
-            }
-    
-            ui.horizontal(|ui| {
-                ui.label("🔍 連續期數模式:");
-                ui.text_edit_singleline(&mut self.filter);
-            });
-            
-            // 添加模式格式說明
-            ui.label("💡 格式說明: 單單雙,雙雙單 表示第1位匹配「單單雙」，第2位匹配「雙雙單」");
-            ui.label("💡 可用模式：單/雙/大/小 (大表示≥6，小表示<6)");
-    
+            if ui.button("📥 獲取數據").clicked() { self.fetch_data(); }
             ui.label(&self.status);
-    
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if !self.filter.is_empty() && !self.draws.is_empty() {
-                    // 查找所有連續期數匹配模式
-                    let all_matched = self.find_all_consecutive_patterns(&self.filter);
-                    
-                    if !all_matched.is_empty() {
-                        ui.heading(format!("🎯 找到 {} 組連續模式：", all_matched.len()));
-                        
-                        for (group_idx, matched_group) in all_matched.iter().enumerate() {
-                            // 默認展開所有組
-                            ui.heading(format!("🔍 匹配組 #{} (期數: {})", group_idx + 1, matched_group.len()));
-                            
-                            // 直接顯示每個組的結果，不使用折疊面板
-                            for draw in matched_group {
-                                // 獲取所有數字，用於顯示指定位置的數字
-                                let numbers: Vec<String> = draw.result
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .collect();
-                                    
-                                // 顯示結果，包括指定位置的數字
-                                let position_patterns: Vec<&str> = self.filter.split(',').collect();
-                                let mut position_info = String::new();
-                                
-                                for (idx, _) in position_patterns.iter().enumerate() {
-                                    let position = idx + 1;
-                                    if position <= numbers.len() {
-                                        let num = &numbers[position - 1];
-                                        position_info.push_str(&format!("第{}位: {}, ", position, num));
-                                    }
-                                }
-                                
-                                // 去掉最後的逗號和空格
-                                if !position_info.is_empty() {
-                                    position_info = position_info[..position_info.len() - 2].to_string();
-                                }
-                                
-                                let beijing_time = Self::timestamp_to_beijing_time(draw.drawTime);
-                                ui.label(format!("✅ [{}] {} → {} ({})", beijing_time, draw.drawNumber, draw.result, position_info));
-                            }
-                            
-                            // 添加分隔線以區分不同組
-                            if group_idx < all_matched.len() - 1 {
-                                ui.separator();
-                            }
-                        }
-                    } else {
-                        ui.label("❌ 沒有找到符合連續模式的結果");
-                    }
-                } else if !self.draws.is_empty() {
-                    // 顯示所有資料
-                    ui.heading("📋 全部數據：");
-                    let mut sorted_draws = self.draws.clone();
-                    sorted_draws.sort_by(|a, b| a.drawNumber.cmp(&b.drawNumber));
-                    
-                    for draw in sorted_draws {
-                        let numbers: Vec<String> = draw.result
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect();
-                            
-                        let first_few_nums = if numbers.len() >= 3 {
-                            format!("前三號：{}, {}, {}", numbers[0], numbers[1], numbers[2])
-                        } else if !numbers.is_empty() {
-                            format!("首號：{}", numbers[0])
-                        } else {
-                            "無數據".to_string()
-                        };
-                        
-                        ui.label(format!("📊 {} → {} ({})", draw.drawNumber, draw.result, first_few_nums));
-                    }
-                }
-            });
-        });
-    }
-}
+            ui.separator();
+            ui.horizontal(|ui| { ui.label("🔍 連續模式:"); ui.text_edit_singleline(&mut self.filter); });
+            ui.label("💡 格式: 1單單23雙雙 (數字=位置, 23=位置2或3, 後跟模式)");
+            ui.label("💡 模式: 單/雙/大/小 (大≥6, 小<6)");
+            ui.separator();
 
-// 原始的匹配函數保留，但不再使用
-fn matches_rule(result: &str, rule_input: &str) -> bool {
-    let nums: Vec<u32> = result
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // --- Updated Matching Logic Call and Display ---
+                 if !self.filter.trim().is_empty() && !self.draws.is_empty() {
+                     // Call the function which now returns Result<(matches, rules), error>
+                     let find_result = self.find_matching_sequences(); // No argument needed
 
-    let rule_parts: Vec<&str> = rule_input
-        .as_bytes()
-        .chunks(3)
-        .filter_map(|c| std::str::from_utf8(c).ok())
-        .collect();
+                     match find_result {
+                         // Successfully parsed (even if no matches found)
+                         Ok((all_matched, parsed_rules)) => {
+                             if !all_matched.is_empty() {
+                                 ui.heading(format!("🎯 找到 {} 組連續模式：", all_matched.len()));
+                                 ui.add_space(5.0);
 
-    if nums.len() < rule_parts.len() {
-        return false;
-    }
+                                 for (group_idx, matched_group) in all_matched.iter().enumerate() {
+                                     ui.push_id(group_idx, |ui| {
+                                         let group_len = matched_group.len(); // Length of this specific match group
 
-    // 倒序逐一匹配
-    for i in 0..rule_parts.len() {
-        let n = nums[nums.len() - 1 - i];
-        let rule = rule_parts[rule_parts.len() - 1 - i];
+                                         for draw in matched_group {
+                                             let beijing_time = Self::timestamp_to_beijing_time(draw.drawTime);
+                                             let mut match_info = String::new();
+                                             let mut added_positions = HashSet::new(); // Track positions per draw
 
-        let is_match = match rule {
-            "單" | "单" => n % 2 != 0,
-            "雙" | "双" => n % 2 == 0,
-            "大" => n >= 6,
-            "小" => n < 6,
-            _ => false,
-        };
+                                             // Attempt to parse numbers for this draw
+                                             let numbers_res: Result<Vec<u32>, _> = draw.result
+                                                .split(',')
+                                                .map(|s| s.trim().parse::<u32>())
+                                                .collect();
 
-        if !is_match {
-            return false;
-        }
-    }
+                                            if let Ok(numbers) = numbers_res {
+                                                // Iterate through the rules that were successfully parsed
+                                                for rule_part in &parsed_rules {
+                                                     // *** Only consider rules relevant to this group's length ***
+                                                     if rule_part.pattern.len() == group_len {
+                                                         for &pos in &rule_part.positions {
+                                                            // Try to insert the position, only proceed if it's new for this draw
+                                                             if added_positions.insert(pos) {
+                                                                 if pos > 0 && pos <= numbers.len() {
+                                                                     let num = numbers[pos - 1];
+                                                                     let characteristic = determine_characteristic(num); // Use the new helper
+                                                                     match_info.push_str(&format!("位{}:{} ", pos, characteristic));
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                 }
+                                             } else {
+                                                 // Handle error parsing numbers for this draw if needed
+                                                 match_info.push_str("[結果解析錯誤] ")
+                                             }
 
-    true
+
+                                             ui.label(format!(
+                                                 "✅ [{}] {} → {} ({})", // Add match_info here
+                                                 beijing_time,
+                                                 draw.drawNumber,
+                                                 draw.result,
+                                                 match_info.trim_end() // Trim trailing space
+                                             ));
+                                         } // End loop draw in matched_group
+
+                                         if group_idx < all_matched.len() - 1 {
+                                             ui.separator(); ui.add_space(3.0);
+                                         }
+                                     }); // End push_id
+                                 } // End loop group_idx
+                             } else {
+                                 // Parsed OK, but no matches found
+                                 ui.label("❌ 沒有找到符合連續模式的結果");
+                             }
+                         }
+                         // Parsing failed
+                         Err(e) => {
+                             ui.colored_label(egui::Color32::RED, format!("❌ 模式錯誤: {:?}", e));
+                         }
+                     } // End match find_result
+                 } else if !self.draws.is_empty() {
+                     // Display all data if no filter
+                     ui.heading("📋 全部數據：");
+                     for draw in &self.draws {
+                         let beijing_time = Self::timestamp_to_beijing_time(draw.drawTime);
+                         ui.label(format!("📊 [{}] {} → {}", beijing_time, draw.drawNumber, draw.result));
+                     }
+                 } else {
+                     if !self.status.contains("載入失敗") && !self.status.contains("抓取中"){ ui.label("請先獲取數據..."); }
+                 }
+                 // --- End Updated Display ---
+            }); // End ScrollArea
+        }); // End CentralPanel
+    } // End update
 }
 
 fn main() -> eframe::Result<()> {
